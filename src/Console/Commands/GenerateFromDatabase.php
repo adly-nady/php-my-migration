@@ -9,7 +9,8 @@ use Illuminate\Support\Str;
 use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\App;
 use Illuminate\Support\Facades\Config;
-
+use Illuminate\Support\Facades\Artisan;
+use Illuminate\Support\Facades\Log;
 
 class GenerateFromDatabase extends Command
 {
@@ -18,7 +19,10 @@ class GenerateFromDatabase extends Command
                           {--with-models : Generate both migration files and model classes}
                           {--connection= : The database connection to use}
                           {--force : Force overwrite of existing files}
-                          {--path= : Custom output path for migrations and models}';
+                          {--path= : Custom output path for migrations and models}
+                          {--exclude= : Comma-separated list of tables to exclude}
+                          {--include= : Comma-separated list of tables to include only}
+                          {--dry-run : Show what would be generated without actually creating files}';
 
     protected $description = 'Generate migrations and models from existing database tables with relationships';
 
@@ -28,23 +32,17 @@ class GenerateFromDatabase extends Command
     protected $processedTables = 0;
     protected $totalTables = 0;
     protected $table;
+    protected $excludedTables = [];
+    protected $includedTables = [];
+    protected $dryRun = false;
 
     public function handle()
     {
-        $connection = $this->option('connection') ?: Config::get('database.default');
-        $onlyMigrations = $this->option('only-migrations');
-        $withModels = $this->option('with-models');
-        $force = $this->option('force');
-        $customPath = $this->option('path');
-
-        if (!$onlyMigrations && !$withModels) {
-            $onlyMigrations = true;
-        }
-
-        $this->setPaths($customPath);
-
         try {
-            $tables = $this->getAllTables($connection);
+            $this->setupOptions();
+            $this->setPaths($this->option('path'));
+            
+            $tables = $this->getAllTables($this->option('connection'));
             
             if (empty($tables)) {
                 $this->error('No tables found in the database.');
@@ -55,17 +53,125 @@ class GenerateFromDatabase extends Command
             $this->info("Found {$this->totalTables} tables to process.");
 
             foreach (array_chunk($tables, $this->batchSize) as $batch) {
-                $this->processBatch($batch, $connection, $onlyMigrations, $withModels, $force);
+                $this->processBatch($batch, $this->option('connection'), $this->option('only-migrations'), $this->option('with-models'), $this->option('force'));
                 $this->processedTables += count($batch);
                 $this->info("Processed {$this->processedTables}/{$this->totalTables} tables.");
             }
 
-            $this->info('Generation completed successfully!');
+            if (!$this->dryRun) {
+                $this->info('Generation completed successfully!');
+            } else {
+                $this->info('Dry run completed. No files were created.');
+            }
+            
             return 0;
         } catch (\Exception $e) {
+            Log::error('PhpMyMigration Error: ' . $e->getMessage(), [
+                'trace' => $e->getTraceAsString(),
+                'connection' => $this->option('connection')
+            ]);
+            
             $this->error('Error: ' . $e->getMessage());
             return 1;
         }
+    }
+
+    protected function setupOptions()
+    {
+        $this->dryRun = $this->option('dry-run');
+        
+        if ($exclude = $this->option('exclude')) {
+            $this->excludedTables = array_map('trim', explode(',', $exclude));
+        }
+        
+        if ($include = $this->option('include')) {
+            $this->includedTables = array_map('trim', explode(',', $include));
+        }
+    }
+
+    protected function shouldProcessTable($tableName)
+    {
+        if (!empty($this->includedTables)) {
+            return in_array($tableName, $this->includedTables);
+        }
+        
+        if (!empty($this->excludedTables)) {
+            return !in_array($tableName, $this->excludedTables);
+        }
+        
+        return true;
+    }
+
+    protected function processBatch($tables, $connection, $onlyMigrations, $withModels, $force)
+    {
+        $tableInfo = [];
+        foreach ($tables as $table) {
+            $tableName = array_values((array) $table)[0];
+            
+            if ($tableName === 'migrations' || !$this->shouldProcessTable($tableName)) {
+                continue;
+            }
+            
+            try {
+                $tableInfo[$tableName] = $this->getTableInfo($tableName, $connection);
+            } catch (\Exception $e) {
+                Log::warning("Error processing table {$tableName}: " . $e->getMessage());
+                $this->warn("Error processing table {$tableName}: " . $e->getMessage());
+            }
+        }
+
+        foreach ($tableInfo as $tableName => $info) {
+            try {
+                if (!$this->dryRun) {
+                    $this->generateMigration($tableName, $info, $force);
+                    
+                    if ($withModels && !$onlyMigrations) {
+                        $this->generateModel($tableName, $info, $tableInfo, $force);
+                    }
+                } else {
+                    $this->info("Would generate migration for table: {$tableName}");
+                    if ($withModels && !$onlyMigrations) {
+                        $this->info("Would generate model for table: {$tableName}");
+                    }
+                }
+            } catch (\Exception $e) {
+                Log::warning("Error generating files for table {$tableName}: " . $e->getMessage());
+                $this->warn("Error generating files for table {$tableName}: " . $e->getMessage());
+            }
+        }
+    }
+
+    protected function getTableInfo($tableName, $connection)
+    {
+        $info = [
+            'table' => $tableName,
+            'columns' => DB::connection($connection)->select("SHOW COLUMNS FROM `{$tableName}`"),
+            'foreign_keys' => DB::connection($connection)->select("
+                SELECT 
+                    k.COLUMN_NAME,
+                    k.REFERENCED_TABLE_NAME,
+                    k.REFERENCED_COLUMN_NAME,
+                    rc.UPDATE_RULE,
+                    rc.DELETE_RULE
+                FROM information_schema.KEY_COLUMN_USAGE k
+                JOIN information_schema.REFERENTIAL_CONSTRAINTS rc 
+                    ON k.CONSTRAINT_NAME = rc.CONSTRAINT_NAME
+                    AND k.TABLE_SCHEMA = rc.CONSTRAINT_SCHEMA
+                WHERE k.TABLE_SCHEMA = DATABASE()
+                AND k.TABLE_NAME = '{$tableName}'
+                AND k.REFERENCED_TABLE_NAME IS NOT NULL
+            "),
+            'indexes' => DB::connection($connection)->select("SHOW INDEX FROM `{$tableName}`"),
+            'primary_keys' => DB::connection($connection)->select("
+                SELECT COLUMN_NAME
+                FROM information_schema.KEY_COLUMN_USAGE
+                WHERE TABLE_SCHEMA = DATABASE()
+                AND TABLE_NAME = '{$tableName}'
+                AND CONSTRAINT_NAME = 'PRIMARY'
+            "),
+        ];
+
+        return $info;
     }
 
     protected function setPaths($customPath)
@@ -74,8 +180,8 @@ class GenerateFromDatabase extends Command
             $this->migrationsPath = $customPath . '/migrations';
             $this->modelsPath = $customPath . '/Models';
         } else {
-            $this->migrationsPath = rtrim(app_path(), '/app') . '/database/migrations';
-            $this->modelsPath = app_path('Models');
+            $this->migrationsPath = rtrim(App::basePath(), '/app') . '/database/migrations';
+            $this->modelsPath = App::basePath('app/Models');
         }
 
         if (!File::exists($this->migrationsPath)) {
@@ -93,66 +199,6 @@ class GenerateFromDatabase extends Command
         }
 
         return DB::connection($connection)->select('SHOW TABLES');
-    }
-
-    protected function processBatch($tables, $connection, $onlyMigrations, $withModels, $force)
-    {
-        $tableInfo = [];
-        foreach ($tables as $table) {
-            $tableName = array_values((array) $table)[0];
-            if ($tableName === 'migrations') continue;
-            
-            try {
-                $tableInfo[$tableName] = $this->getTableInfo($tableName, $connection);
-            } catch (\Exception $e) {
-                $this->warn("Error processing table {$tableName}: " . $e->getMessage());
-            }
-        }
-
-        foreach ($tableInfo as $tableName => $info) {
-            try {
-                $this->generateMigration($tableName, $info, $force);
-                
-                if ($withModels && !$onlyMigrations) {
-                    $this->generateModel($tableName, $info, $tableInfo, $force);
-                }
-            } catch (\Exception $e) {
-                $this->warn("Error generating files for table {$tableName}: " . $e->getMessage());
-            }
-        }
-    }
-
-    protected function getTableInfo($tableName, $connection)
-    {
-        $info = [
-            'table' => $tableName,
-            'columns' => DB::connection($connection)->select("SHOW COLUMNS FROM `{$tableName}`"),
-            'foreign_keys' => DB::connection($connection)->select("
-                SELECT 
-                    k.COLUMN_NAME,
-                    k.REFERENCED_TABLE_NAME,
-                    k.REFERENCED_COLUMN_NAME,
-                    c.UPDATE_RULE,
-                    c.DELETE_RULE
-                FROM information_schema.KEY_COLUMN_USAGE k
-                JOIN information_schema.TABLE_CONSTRAINTS c 
-                    ON k.CONSTRAINT_NAME = c.CONSTRAINT_NAME
-                WHERE k.TABLE_SCHEMA = DATABASE()
-                AND k.TABLE_NAME = '{$tableName}'
-                AND k.REFERENCED_TABLE_NAME IS NOT NULL
-                AND c.CONSTRAINT_TYPE = 'FOREIGN KEY'
-            "),
-            'indexes' => DB::connection($connection)->select("SHOW INDEX FROM `{$tableName}`"),
-            'primary_keys' => DB::connection($connection)->select("
-                SELECT COLUMN_NAME
-                FROM information_schema.KEY_COLUMN_USAGE
-                WHERE TABLE_SCHEMA = DATABASE()
-                AND TABLE_NAME = '{$tableName}'
-                AND CONSTRAINT_NAME = 'PRIMARY'
-            "),
-        ];
-
-        return $info;
     }
 
     protected function generateMigration($tableName, $info, $force)
@@ -307,56 +353,75 @@ class GenerateFromDatabase extends Command
 
     protected function generateModelContent($tableName, $info, $allTables)
     {
-        $modelName = Str::studly(Str::singular($tableName));
-        $hasSoftDeletes = false;
-        $fillable = [];
-        $casts = [];
-        $relationships = [];
-        
-        foreach ($info['columns'] as $column) {
-            $column = (array) $column;
-            $name = $column['Field'];
+        try {
+            $this->table = $tableName;
+            $modelName = Str::studly(Str::singular($tableName));
+            $hasSoftDeletes = false;
+            $fillable = [];
+            $casts = [];
+            $relationships = [];
             
-            if (in_array($name, ['id', 'created_at', 'updated_at'])) {
-                continue;
+            foreach ($info['columns'] as $column) {
+                $column = (array) $column;
+                $name = $column['Field'] ?? '';
+                
+                if (empty($name) || in_array($name, ['id', 'created_at', 'updated_at'])) {
+                    continue;
+                }
+                
+                if ($name === 'deleted_at') {
+                    $hasSoftDeletes = true;
+                    continue;
+                }
+                
+                if (!$this->isForeignKey($info['foreign_keys'], $name)) {
+                    $fillable[] = $name;
+                }
+                
+                $type = $this->mapColumnType($column['Type']);
+                if ($this->shouldCast($type)) {
+                    $casts[$name] = $this->mapCastType($type);
+                }
             }
             
-            if ($name === 'deleted_at') {
-                $hasSoftDeletes = true;
-                continue;
-            }
-            
-            if (!$this->isForeignKey($info['foreign_keys'], $name)) {
-                $fillable[] = $name;
-            }
-            
-            $type = $this->mapColumnType($column['Type']);
-            if ($this->shouldCast($type)) {
-                $casts[$name] = $this->mapCastType($type);
-            }
-        }
-        
-        foreach ($info['foreign_keys'] as $fk) {
-            $fk = (array) $fk;
-            $relatedModel = Str::studly(Str::singular($fk['REFERENCED_TABLE_NAME']));
-            $localKey = $fk['COLUMN_NAME'];
-            
-            $relationships[] = [
-                'type' => 'belongsTo',
-                'model' => $relatedModel,
-                'foreignKey' => $localKey,
-                'ownerKey' => $fk['REFERENCED_COLUMN_NAME'],
-            ];
-        }
-        
-        foreach ($allTables as $otherTable => $otherInfo) {
-            if ($otherTable === $tableName) continue;
-            
-            foreach ($otherInfo['foreign_keys'] as $fk) {
+            foreach ($info['foreign_keys'] as $fk) {
                 $fk = (array) $fk;
-                if ($fk['REFERENCED_TABLE_NAME'] === $tableName) {
+                if (empty($fk['REFERENCED_TABLE_NAME']) || empty($fk['COLUMN_NAME']) || 
+                    empty($fk['REFERENCED_COLUMN_NAME'])) {
+                    continue;
+                }
+                
+                $relatedModel = Str::studly(Str::singular($fk['REFERENCED_TABLE_NAME']));
+                $localKey = $fk['COLUMN_NAME'];
+                
+                if (empty($relatedModel) || empty($localKey)) {
+                    continue;
+                }
+                
+                $relationships[] = [
+                    'type' => 'belongsTo',
+                    'model' => $relatedModel,
+                    'foreignKey' => $localKey,
+                    'ownerKey' => $fk['REFERENCED_COLUMN_NAME'],
+                ];
+            }
+            
+            foreach ($allTables as $otherTable => $otherInfo) {
+                if ($otherTable === $tableName) continue;
+                
+                foreach ($otherInfo['foreign_keys'] as $fk) {
+                    $fk = (array) $fk;
+                    if (empty($fk['REFERENCED_TABLE_NAME']) || empty($fk['COLUMN_NAME']) || 
+                        empty($fk['REFERENCED_COLUMN_NAME']) || $fk['REFERENCED_TABLE_NAME'] !== $tableName) {
+                        continue;
+                    }
+                    
                     $relatedModel = Str::studly(Str::singular($otherTable));
                     $foreignKey = $fk['COLUMN_NAME'];
+                    
+                    if (empty($relatedModel) || empty($foreignKey)) {
+                        continue;
+                    }
                     
                     $relationships[] = [
                         'type' => 'hasMany',
@@ -366,63 +431,66 @@ class GenerateFromDatabase extends Command
                     ];
                 }
             }
-        }
-        
-        if ($this->isPivotTable($info)) {
-            $pivotRelations = $this->getPivotRelations($info, $allTables);
-            $relationships = array_merge($relationships, $pivotRelations);
-        }
-        
-        $content = "<?php\n\n";
-        $content .= "namespace App\\Models;\n\n";
-        $content .= "use Illuminate\\Database\\Eloquent\\Model;\n";
-        if ($hasSoftDeletes) {
-            $content .= "use Illuminate\\Database\\Eloquent\\SoftDeletes;\n";
-        }
-        $content .= "\n";
-        
-        $content .= "/**\n";
-        $content .= " * {$modelName} Model\n";
-        $content .= " *\n";
-        foreach ($info['columns'] as $column) {
-            $column = (array) $column;
-            $type = $this->mapPhpDocType($column['Type']);
-            $content .= " * @property {$type} \${$column['Field']}\n";
-        }
-        $content .= " */\n";
-        
-        $content .= "class {$modelName} extends Model\n";
-        $content .= "{\n";
-        
-        if ($hasSoftDeletes) {
-            $content .= "    use SoftDeletes;\n\n";
-        }
-        
-        $content .= "    protected \$table = '{$tableName}';\n\n";
-        
-        if (!empty($fillable)) {
-            $content .= "    protected \$fillable = [\n";
-            foreach ($fillable as $field) {
-                $content .= "        '{$field}',\n";
+            
+            if ($this->isPivotTable($info)) {
+                $pivotRelations = $this->getPivotRelations($info, $allTables);
+                $relationships = array_merge($relationships, $pivotRelations);
             }
-            $content .= "    ];\n\n";
-        }
-        
-        if (!empty($casts)) {
-            $content .= "    protected \$casts = [\n";
-            foreach ($casts as $field => $type) {
-                $content .= "        '{$field}' => '{$type}',\n";
+            
+            $content = "<?php\n\n";
+            $content .= "namespace App\\Models;\n\n";
+            $content .= "use Illuminate\\Database\\Eloquent\\Model;\n";
+            if ($hasSoftDeletes) {
+                $content .= "use Illuminate\\Database\\Eloquent\\SoftDeletes;\n";
             }
-            $content .= "    ];\n\n";
+            $content .= "\n";
+            
+            $content .= "/**\n";
+            $content .= " * {$modelName} Model\n";
+            $content .= " *\n";
+            foreach ($info['columns'] as $column) {
+                $column = (array) $column;
+                $type = $this->mapPhpDocType($column['Type']);
+                $content .= " * @property {$type} \${$column['Field']}\n";
+            }
+            $content .= " */\n";
+            
+            $content .= "class {$modelName} extends Model\n";
+            $content .= "{\n";
+            
+            if ($hasSoftDeletes) {
+                $content .= "    use SoftDeletes;\n\n";
+            }
+            
+            $content .= "    protected \$table = '{$tableName}';\n\n";
+            
+            if (!empty($fillable)) {
+                $content .= "    protected \$fillable = [\n";
+                foreach ($fillable as $field) {
+                    $content .= "        '{$field}',\n";
+                }
+                $content .= "    ];\n\n";
+            }
+            
+            if (!empty($casts)) {
+                $content .= "    protected \$casts = [\n";
+                foreach ($casts as $field => $type) {
+                    $content .= "        '{$field}' => '{$type}',\n";
+                }
+                $content .= "    ];\n\n";
+            }
+            
+            foreach ($relationships as $relation) {
+                $content .= $this->generateRelationshipMethod($relation);
+            }
+            
+            $content .= "}\n";
+            
+            return $content;
+        } catch (\Exception $e) {
+            Log::warning("Error generating model for table {$tableName}: " . $e->getMessage());
+            return '';
         }
-        
-        foreach ($relationships as $relation) {
-            $content .= $this->generateRelationshipMethod($relation);
-        }
-        
-        $content .= "}\n";
-        
-        return $content;
     }
 
     protected function isForeignKey($foreignKeys, $columnName)
@@ -460,68 +528,115 @@ class GenerateFromDatabase extends Command
 
     protected function getPivotRelations($info, $allTables)
     {
-        $relations = [];
-        $foreignKeys = $info['foreign_keys'];
-        
-        if (count($foreignKeys) === 2) {
-            $fk1 = (array) $foreignKeys[0];
-            $fk2 = (array) $foreignKeys[1];
+        try {
+            $relations = [];
+            $foreignKeys = $info['foreign_keys'] ?? [];
             
-            $table1 = $fk1['REFERENCED_TABLE_NAME'];
-            $table2 = $fk2['REFERENCED_TABLE_NAME'];
+            if (count($foreignKeys) === 2) {
+                $fk1 = (array) $foreignKeys[0];
+                $fk2 = (array) $foreignKeys[1];
+                
+                if (empty($fk1['REFERENCED_TABLE_NAME']) || empty($fk2['REFERENCED_TABLE_NAME']) ||
+                    empty($fk1['COLUMN_NAME']) || empty($fk2['COLUMN_NAME'])) {
+                    return $relations;
+                }
+                
+                $table1 = $fk1['REFERENCED_TABLE_NAME'];
+                $table2 = $fk2['REFERENCED_TABLE_NAME'];
+                
+                if (empty($table1) || empty($table2)) {
+                    return $relations;
+                }
+                
+                $model1 = Str::studly(Str::singular($table1));
+                $model2 = Str::studly(Str::singular($table2));
+                
+                if (empty($model1) || empty($model2)) {
+                    return $relations;
+                }
+                
+                $relations[] = [
+                    'type' => 'belongsToMany',
+                    'model' => $model1,
+                    'table' => $info['table'],
+                    'foreignKey' => $fk1['COLUMN_NAME'],
+                    'relatedKey' => $fk2['COLUMN_NAME'],
+                    'relationName' => Str::camel(Str::plural($table2)),
+                ];
+                
+                $relations[] = [
+                    'type' => 'belongsToMany',
+                    'model' => $model2,
+                    'table' => $info['table'],
+                    'foreignKey' => $fk2['COLUMN_NAME'],
+                    'relatedKey' => $fk1['COLUMN_NAME'],
+                    'relationName' => Str::camel(Str::plural($table1)),
+                ];
+            }
             
-            $relations[] = [
-                'type' => 'belongsToMany',
-                'model' => Str::studly(Str::singular($table1)),
-                'table' => $info['table'],
-                'foreignKey' => $fk1['COLUMN_NAME'],
-                'relatedKey' => $fk2['COLUMN_NAME'],
-                'relationName' => Str::camel(Str::plural($table2)),
-            ];
-            
-            $relations[] = [
-                'type' => 'belongsToMany',
-                'model' => Str::studly(Str::singular($table2)),
-                'table' => $info['table'],
-                'foreignKey' => $fk2['COLUMN_NAME'],
-                'relatedKey' => $fk1['COLUMN_NAME'],
-                'relationName' => Str::camel(Str::plural($table1)),
-            ];
+            return $relations;
+        } catch (\Exception $e) {
+            Log::warning("Error generating pivot relations: " . $e->getMessage());
+            return [];
         }
-        
-        return $relations;
     }
 
     protected function generateRelationshipMethod($relation)
     {
-        $content = "    /**\n";
-        $content .= "     * Get the " . Str::singular($relation['model']) . " that owns this " . Str::singular($this->table) . "\n";
-        $content .= "     */\n";
-        
-        switch ($relation['type']) {
-            case 'belongsTo':
-                $content .= "    public function " . Str::camel(Str::singular($relation['model'])) . "()\n";
-                $content .= "    {\n";
-                $content .= "        return \$this->belongsTo({$relation['model']}::class, '{$relation['foreignKey']}', '{$relation['ownerKey']}');\n";
-                $content .= "    }\n\n";
-                break;
-                
-            case 'hasMany':
-                $content .= "    public function " . Str::camel(Str::plural($relation['model'])) . "()\n";
-                $content .= "    {\n";
-                $content .= "        return \$this->hasMany({$relation['model']}::class, '{$relation['foreignKey']}', '{$relation['localKey']}');\n";
-                $content .= "    }\n\n";
-                break;
-                
-            case 'belongsToMany':
-                $content .= "    public function {$relation['relationName']}()\n";
-                $content .= "    {\n";
-                $content .= "        return \$this->belongsToMany({$relation['model']}::class, '{$relation['table']}', '{$relation['foreignKey']}', '{$relation['relatedKey']}');\n";
-                $content .= "    }\n\n";
-                break;
+        try {
+            if (empty($relation['model']) || empty($relation['type'])) {
+                return '';
+            }
+
+            $modelName = $relation['model'];
+            $tableName = $this->table ?? '';
+            
+            if (empty($modelName) || empty($tableName)) {
+                return '';
+            }
+
+            $content = "    /**\n";
+            $content .= "     * Get the " . Str::singular($modelName) . " that owns this " . Str::singular($tableName) . "\n";
+            $content .= "     */\n";
+            
+            switch ($relation['type']) {
+                case 'belongsTo':
+                    if (empty($relation['foreignKey']) || empty($relation['ownerKey'])) {
+                        return '';
+                    }
+                    $content .= "    public function " . Str::camel(Str::singular($modelName)) . "()\n";
+                    $content .= "    {\n";
+                    $content .= "        return \$this->belongsTo({$modelName}::class, '{$relation['foreignKey']}', '{$relation['ownerKey']}');\n";
+                    $content .= "    }\n\n";
+                    break;
+                    
+                case 'hasMany':
+                    if (empty($relation['foreignKey']) || empty($relation['localKey'])) {
+                        return '';
+                    }
+                    $content .= "    public function " . Str::camel(Str::plural($modelName)) . "()\n";
+                    $content .= "    {\n";
+                    $content .= "        return \$this->hasMany({$modelName}::class, '{$relation['foreignKey']}', '{$relation['localKey']}');\n";
+                    $content .= "    }\n\n";
+                    break;
+                    
+                case 'belongsToMany':
+                    if (empty($relation['relationName']) || empty($relation['table']) || 
+                        empty($relation['foreignKey']) || empty($relation['relatedKey'])) {
+                        return '';
+                    }
+                    $content .= "    public function {$relation['relationName']}()\n";
+                    $content .= "    {\n";
+                    $content .= "        return \$this->belongsToMany({$modelName}::class, '{$relation['table']}', '{$relation['foreignKey']}', '{$relation['relatedKey']}');\n";
+                    $content .= "    }\n\n";
+                    break;
+            }
+            
+            return $content;
+        } catch (\Exception $e) {
+            Log::warning("Error generating relationship method: " . $e->getMessage());
+            return '';
         }
-        
-        return $content;
     }
 
     protected function mapPhpDocType($type)
