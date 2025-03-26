@@ -21,7 +21,7 @@
                 "shasum": ""
             },
             "require": {
-                "php": "^8.1"
+                "php": "^8.2"
             },
             "conflict": {
                 "doctrine/dbal": "<4.0.0 || >=5.0.0"

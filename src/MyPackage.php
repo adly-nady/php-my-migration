@@ -11,7 +11,6 @@ class MyPackage
 
     public function convertTablesToMigrations()
     {
-        // TODO: Implement the main functionality
         return true;
     }
 } 

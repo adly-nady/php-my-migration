@@ -3,7 +3,7 @@
 namespace AdlyNady\PhpMyMigration;
 
 use Illuminate\Support\ServiceProvider;
-use AdlyNady\PhpMyMigration\Console\Commands\GenerateMigrationsCommand;
+use AdlyNady\PhpMyMigration\Console\Commands\GenerateFromDatabase;
 
 class MyPackageServiceProvider extends ServiceProvider
 {
@@ -11,14 +11,13 @@ class MyPackageServiceProvider extends ServiceProvider
     {
         if ($this->app->runningInConsole()) {
             $this->commands([
-                GenerateMigrationsCommand::class,
+                GenerateFromDatabase::class,
             ]);
         }
     }
 
     public function register()
     {
-        // هنا بتسجل الخدمات بتاعتك
         $this->app->singleton('mypackage', function () {
             return new MyPackage();
         });
