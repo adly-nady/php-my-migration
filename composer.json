@@ -1,0 +1,32 @@
+{
+    "name": "adly-nady/php-my-migration",
+    "description": "It converts all existing tables in MySQL that do not have migration files to migration files. If they exist, it compares the columns and their data types with the existing ones and syncs the existing ones to MySQL.",
+    "type": "laravel-package",
+    "license": "MIT",
+    "version": "1.0.0",
+    "minimum-stability": "dev",
+    "autoload": {
+        "psr-4": {
+            "AdlyNady\\PhpMyMigration\\": "src/"
+        }
+    },
+    "authors": [
+        {
+            "name": "adly-nady",
+            "email": "adlynadyadly1@gmail.com"
+        }
+    ],
+    "extra": {
+        "laravel": {
+            "providers": [
+                "AdlyNady\\PhpMyMigration\\MyPackageServiceProvider"
+            ]
+        }
+    },
+    "require": {
+        "php": "^8.0",
+        "illuminate/support": "^9.0|^10.0",
+        "illuminate/console": "^9.0|^10.0",
+        "illuminate/database": "^9.0|^10.0"
+    }
+}
