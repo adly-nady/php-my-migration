@@ -63,7 +63,6 @@ class GenerateFromDatabase extends Command
             } else {
                 $this->info('Dry run completed. No files were created.');
             }
-            
             return 0;
         } catch (\Exception $e) {
             Log::error('PhpMyMigration Error: ' . $e->getMessage(), [
@@ -135,7 +134,6 @@ class GenerateFromDatabase extends Command
                     }
                 }
             } catch (\Exception $e) {
-                Log::warning("Error generating files for table {$tableName}: " . $e->getMessage());
                 $this->warn("Error generating files for table {$tableName}: " . $e->getMessage());
             }
         }
